@@ -170,10 +170,14 @@ def get_stock_realtime(symbol: str) -> dict:
     df = ak.stock_individual_spot_xq(symbol=xq)
     if df is None or df.empty:
         return {"ok": False, "symbol": symbol, "error": "symbol not found"}
-    records = _df_records(df)
-    if not records:
-        return {"ok": False, "symbol": symbol, "error": "empty response"}
-    return {"ok": True, "symbol": symbol, "source": "xueqiu", "data": records[0]}
+    if set(df.columns) >= {"item", "value"}:
+        flat = {str(row["item"]): row["value"] for _, row in df.iterrows()}
+    else:
+        records = _df_records(df)
+        if not records:
+            return {"ok": False, "symbol": symbol, "error": "empty response"}
+        flat = records[0]
+    return {"ok": True, "symbol": symbol, "source": "xueqiu", "data": flat}
 
 
 @mcp.tool

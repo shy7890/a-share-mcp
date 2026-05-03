@@ -7,6 +7,8 @@ from functools import wraps
 
 import akshare as ak
 import pandas as pd
+import requests
+from bs4 import BeautifulSoup
 from fastmcp import FastMCP
 
 logging.basicConfig(level=logging.INFO)
@@ -22,6 +24,11 @@ MAX_DAYS = 1000
 CACHE_TTL_PRICE = 300
 CACHE_TTL_FINANCIAL = 3600
 CACHE_TTL_REALTIME = 20
+CACHE_TTL_TRENDING = 1800
+CACHE_TTL_REPO = 600
+
+UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+TRENDING_PERIODS = {"daily", "weekly", "monthly"}
 
 
 def _df_records(df: pd.DataFrame) -> list[dict]:
@@ -167,6 +174,102 @@ def get_stock_realtime(symbol: str) -> dict:
     if not records:
         return {"ok": False, "symbol": symbol, "error": "empty response"}
     return {"ok": True, "symbol": symbol, "source": "xueqiu", "data": records[0]}
+
+
+@mcp.tool
+@ttl_cache(CACHE_TTL_TRENDING)
+@with_retry
+def get_github_trending(language: str = "", period: str = "daily", limit: int = 25) -> dict:
+    """获取 GitHub Trending 榜单。
+
+    language: 语言筛选，留空表示全部；常见值：python / javascript / typescript / rust / go / cpp / java
+    period: daily / weekly / monthly，默认 daily
+    limit: 返回前 N 个仓库，默认 25，最大 25
+    """
+    period = period.lower()
+    if period not in TRENDING_PERIODS:
+        return {"ok": False, "error": f"period must be one of {sorted(TRENDING_PERIODS)}"}
+    limit = max(1, min(int(limit), 25))
+    lang = language.strip().lower()
+    url = f"https://github.com/trending/{lang}" if lang else "https://github.com/trending"
+
+    r = requests.get(url, params={"since": period}, headers={"User-Agent": UA}, timeout=15)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
+
+    repos = []
+    for art in soup.select("article.Box-row")[:limit]:
+        h2_a = art.select_one("h2 a")
+        if not h2_a:
+            continue
+        full_name = " ".join(h2_a.get_text().split()).replace(" / ", "/")
+        desc_el = art.select_one("p")
+        desc = desc_el.get_text(strip=True) if desc_el else ""
+        lang_el = art.select_one("span[itemprop='programmingLanguage']")
+        repo_lang = lang_el.get_text(strip=True) if lang_el else ""
+        link_muteds = art.select("a.Link--muted")
+        stars = link_muteds[0].get_text(strip=True).replace(",", "") if link_muteds else ""
+        forks = link_muteds[1].get_text(strip=True).replace(",", "") if len(link_muteds) > 1 else ""
+        added_el = art.select_one("span.d-inline-block.float-sm-right")
+        stars_added = " ".join(added_el.get_text().split()) if added_el else ""
+        repos.append({
+            "name": full_name,
+            "url": "https://github.com/" + full_name,
+            "description": desc,
+            "language": repo_lang,
+            "stars": stars,
+            "forks": forks,
+            "stars_added": stars_added,
+        })
+
+    return {
+        "ok": True,
+        "language": lang or "all",
+        "period": period,
+        "count": len(repos),
+        "data": repos,
+    }
+
+
+@mcp.tool
+@ttl_cache(CACHE_TTL_REPO)
+@with_retry
+def get_github_repo(repo: str) -> dict:
+    """查询 GitHub 仓库详情。repo 形如 owner/name，例如 anthropics/claude-code。"""
+    repo = repo.strip().strip("/")
+    if "/" not in repo:
+        return {"ok": False, "error": "repo must be in 'owner/name' format"}
+
+    headers = {"User-Agent": UA, "Accept": "application/vnd.github+json"}
+    token = os.environ.get("GITHUB_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    r = requests.get(f"https://api.github.com/repos/{repo}", headers=headers, timeout=10)
+    if r.status_code == 404:
+        return {"ok": False, "error": "repo not found"}
+    r.raise_for_status()
+    d = r.json()
+    return {
+        "ok": True,
+        "data": {
+            "name": d.get("full_name"),
+            "description": d.get("description"),
+            "language": d.get("language"),
+            "stars": d.get("stargazers_count"),
+            "forks": d.get("forks_count"),
+            "watchers": d.get("subscribers_count"),
+            "open_issues": d.get("open_issues_count"),
+            "topics": d.get("topics", []),
+            "homepage": d.get("homepage"),
+            "url": d.get("html_url"),
+            "created": d.get("created_at"),
+            "updated": d.get("updated_at"),
+            "pushed": d.get("pushed_at"),
+            "license": (d.get("license") or {}).get("spdx_id"),
+            "default_branch": d.get("default_branch"),
+        },
+    }
 
 
 if __name__ == "__main__":

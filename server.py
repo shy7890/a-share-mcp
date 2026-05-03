@@ -26,6 +26,16 @@ CACHE_TTL_FINANCIAL = 3600
 CACHE_TTL_REALTIME = 20
 CACHE_TTL_TRENDING = 1800
 CACHE_TTL_REPO = 600
+CACHE_TTL_NEWS = 300
+CACHE_TTL_NOTICE = 600
+CACHE_TTL_RESEARCH = 7200
+CACHE_TTL_INFO = 3600
+CACHE_TTL_FUND_FLOW = 300
+CACHE_TTL_NORTH_FLOW = 1800
+CACHE_TTL_INDEX = 60
+CACHE_TTL_SECTOR = 300
+CACHE_TTL_HOT = 120
+CACHE_TTL_LHB = 3600
 
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 TRENDING_PERIODS = {"daily", "weekly", "monthly"}
@@ -178,6 +188,151 @@ def get_stock_realtime(symbol: str) -> dict:
             return {"ok": False, "symbol": symbol, "error": "empty response"}
         flat = records[0]
     return {"ok": True, "symbol": symbol, "source": "xueqiu", "data": flat}
+
+
+@mcp.tool
+@ttl_cache(CACHE_TTL_NEWS)
+@with_retry
+def get_stock_news(symbol: str, limit: int = 20) -> dict:
+    """查询个股相关新闻（东方财富）。返回最近的新闻列表。"""
+    bare = _bare_symbol(symbol)
+    df = ak.stock_news_em(symbol=bare)
+    if df is None or df.empty:
+        return {"ok": True, "symbol": symbol, "count": 0, "data": []}
+    df = df.head(max(1, min(int(limit), 100)))
+    return {"ok": True, "symbol": symbol, "count": len(df), "data": _df_records(df)}
+
+
+@mcp.tool
+@ttl_cache(CACHE_TTL_NOTICE)
+@with_retry
+def get_stock_notice(symbol: str = "全部", date: str = "") -> dict:
+    """查询股票公告。symbol 可填具体代码（如 600519）或 "全部"；date 形如 YYYY-MM-DD，默认今天。"""
+    if not date:
+        date = datetime.now().strftime("%Y-%m-%d")
+    sym = symbol if symbol == "全部" else _bare_symbol(symbol)
+    df = ak.stock_notice_report(symbol=sym, date=date)
+    if df is None or df.empty:
+        return {"ok": True, "symbol": symbol, "date": date, "count": 0, "data": []}
+    return {"ok": True, "symbol": symbol, "date": date, "count": len(df), "data": _df_records(df)}
+
+
+@mcp.tool
+@ttl_cache(CACHE_TTL_RESEARCH)
+@with_retry
+def get_research_reports(symbol: str, limit: int = 20) -> dict:
+    """查询个股研究报告（东方财富研报）。"""
+    bare = _bare_symbol(symbol)
+    df = ak.stock_research_report_em(symbol=bare)
+    if df is None or df.empty:
+        return {"ok": True, "symbol": symbol, "count": 0, "data": []}
+    df = df.head(max(1, min(int(limit), 50)))
+    return {"ok": True, "symbol": symbol, "count": len(df), "data": _df_records(df)}
+
+
+@mcp.tool
+@ttl_cache(CACHE_TTL_INFO)
+@with_retry
+def get_stock_info(symbol: str) -> dict:
+    """查询个股基本信息（市值、流通股、行业、上市日期等）。"""
+    bare = _bare_symbol(symbol)
+    df = ak.stock_individual_info_em(symbol=bare)
+    if df is None or df.empty:
+        return {"ok": False, "symbol": symbol, "error": "no info"}
+    if set(df.columns) >= {"item", "value"}:
+        flat = {str(row["item"]): row["value"] for _, row in df.iterrows()}
+    else:
+        flat = _df_records(df)[0] if _df_records(df) else {}
+    return {"ok": True, "symbol": symbol, "data": flat}
+
+
+@mcp.tool
+@ttl_cache(CACHE_TTL_FUND_FLOW)
+@with_retry
+def get_stock_fund_flow(symbol: str, days: int = 10) -> dict:
+    """查询个股资金流向（主力净流入、超大单/大单/中单/小单）。symbol 形如 600519，days 默认 10 天。"""
+    bare = _bare_symbol(symbol)
+    if bare.startswith("6"):
+        market = "sh"
+    elif bare.startswith(("0", "3")):
+        market = "sz"
+    else:
+        market = "bj"
+    df = ak.stock_individual_fund_flow(stock=bare, market=market)
+    if df is None or df.empty:
+        return {"ok": False, "symbol": symbol, "error": "no fund flow data"}
+    days = max(1, min(int(days), 60))
+    df = df.tail(days)
+    return {"ok": True, "symbol": symbol, "days": days, "count": len(df), "data": _df_records(df)}
+
+
+@mcp.tool
+@ttl_cache(CACHE_TTL_NORTH_FLOW)
+@with_retry
+def get_north_fund_flow(days: int = 30) -> dict:
+    """北向资金（沪深港通北上）历史净流入。days 默认 30 天。"""
+    df = ak.stock_hsgt_hist_em(symbol="北向资金")
+    if df is None or df.empty:
+        return {"ok": False, "error": "no north flow data"}
+    days = max(1, min(int(days), 365))
+    df = df.tail(days)
+    return {"ok": True, "days": days, "count": len(df), "data": _df_records(df)}
+
+
+@mcp.tool
+@ttl_cache(CACHE_TTL_INDEX)
+@with_retry
+def get_index_realtime(category: str = "上证系列指数") -> dict:
+    """A 股主要指数实时行情。
+    category 可选："上证系列指数"（含上证指数、上证 50 等）、"深证系列指数"、"中证系列指数"、"指数成份"。
+    """
+    df = ak.stock_zh_index_spot_em(symbol=category)
+    if df is None or df.empty:
+        return {"ok": False, "error": "no index data"}
+    return {"ok": True, "category": category, "count": len(df), "data": _df_records(df.head(30))}
+
+
+@mcp.tool
+@ttl_cache(CACHE_TTL_SECTOR)
+@with_retry
+def get_sector_ranking(category: str = "industry", limit: int = 30) -> dict:
+    """A 股板块涨跌排行。category: industry（行业板块）或 concept（概念板块）。"""
+    cat = category.strip().lower()
+    if cat == "concept":
+        df = ak.stock_board_concept_name_em()
+    else:
+        cat = "industry"
+        df = ak.stock_board_industry_name_em()
+    if df is None or df.empty:
+        return {"ok": False, "error": "no sector data"}
+    limit = max(1, min(int(limit), 100))
+    return {"ok": True, "category": cat, "count": min(len(df), limit), "data": _df_records(df.head(limit))}
+
+
+@mcp.tool
+@ttl_cache(CACHE_TTL_HOT)
+@with_retry
+def get_hot_stocks(limit: int = 30) -> dict:
+    """A 股市场热度榜（东方财富个股热度排名）。"""
+    df = ak.stock_hot_rank_em()
+    if df is None or df.empty:
+        return {"ok": False, "error": "no hot rank data"}
+    limit = max(1, min(int(limit), 100))
+    return {"ok": True, "count": min(len(df), limit), "data": _df_records(df.head(limit))}
+
+
+@mcp.tool
+@ttl_cache(CACHE_TTL_LHB)
+@with_retry
+def get_lhb_detail(date: str = "") -> dict:
+    """龙虎榜详情（指定日期）。date 形如 YYYYMMDD，默认今天。"""
+    if not date:
+        date = datetime.now().strftime("%Y%m%d")
+    date = date.replace("-", "")
+    df = ak.stock_lhb_detail_em(start_date=date, end_date=date)
+    if df is None or df.empty:
+        return {"ok": True, "date": date, "count": 0, "data": []}
+    return {"ok": True, "date": date, "count": len(df), "data": _df_records(df)}
 
 
 @mcp.tool

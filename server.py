@@ -18,6 +18,7 @@ mcp = FastMCP("a-share-mcp")
 
 MAX_RETRIES = 3
 RETRY_DELAY = 2.0
+RETRY_BACKOFF = 2.0
 DEFAULT_DAYS = 30
 MAX_DAYS = 1000
 
@@ -62,7 +63,7 @@ def with_retry(func):
                 last_err = e
                 log.warning("%s attempt %d/%d failed: %s", func.__name__, attempt, MAX_RETRIES, e)
                 if attempt < MAX_RETRIES:
-                    time.sleep(RETRY_DELAY)
+                    time.sleep(RETRY_DELAY * (RETRY_BACKOFF ** (attempt - 1)))
         return {
             "ok": False,
             "error": type(last_err).__name__,
@@ -115,49 +116,104 @@ def _bare_symbol(symbol: str) -> str:
     return s
 
 
+_KLINE_COLMAP_EAST = {
+    "日期": "date", "开盘": "open", "收盘": "close", "最高": "high", "最低": "low",
+    "成交量": "volume", "成交额": "amount", "涨跌幅": "pct_change",
+}
+
+
+def _normalize_kline(df: pd.DataFrame, source: str) -> pd.DataFrame:
+    if source == "eastmoney":
+        keep = [c for c in _KLINE_COLMAP_EAST if c in df.columns]
+        df = df[keep].rename(columns=_KLINE_COLMAP_EAST)
+    elif source == "sina":
+        keep = [c for c in ("date", "open", "high", "low", "close", "volume", "amount") if c in df.columns]
+        df = df[keep]
+    elif source == "tencent":
+        keep = [c for c in ("date", "open", "close", "high", "low", "amount") if c in df.columns]
+        df = df[keep]
+    return df
+
+
+def _kline_tencent(symbol: str, days: int) -> pd.DataFrame:
+    return ak.stock_zh_a_hist_tx(symbol=_xq_symbol(symbol).lower(), adjust="")
+
+
+def _kline_sina(symbol: str, days: int) -> pd.DataFrame:
+    end = datetime.now().strftime("%Y%m%d")
+    lookback = int(days * 1.6) + 30
+    start = (datetime.now() - timedelta(days=lookback)).strftime("%Y%m%d")
+    return ak.stock_zh_a_daily(
+        symbol=_xq_symbol(symbol).lower(),
+        start_date=start,
+        end_date=end,
+        adjust="",
+    )
+
+
+def _kline_eastmoney(symbol: str, days: int) -> pd.DataFrame:
+    end = datetime.now().strftime("%Y%m%d")
+    lookback = int(days * 1.6) + 30
+    start = (datetime.now() - timedelta(days=lookback)).strftime("%Y%m%d")
+    return ak.stock_zh_a_hist(
+        symbol=_bare_symbol(symbol),
+        period="daily",
+        start_date=start,
+        end_date=end,
+        adjust="",
+    )
+
+
+_KLINE_SOURCES = (
+    ("tencent", _kline_tencent),
+    ("sina", _kline_sina),
+    ("eastmoney", _kline_eastmoney),
+)
+
+
 @mcp.tool
 @ttl_cache(CACHE_TTL_PRICE)
-@with_retry
 def get_stock_price(symbol: str, days: int = DEFAULT_DAYS) -> dict:
     """查询A股日线行情。
 
     symbol 形如 600519 或 sh600519 / sz000001。
     days 取最近 N 个交易日，默认 30，最大 1000。
-    数据源：东方财富（默认）；days > 90 时自动切到腾讯，覆盖更长历史。
+    数据源回退链：腾讯（默认，支持任意长度历史）→ 新浪 → 东方财富。
+    每个源最多重试 3 次（指数退避），上一个源全部失败才切下一个。
     """
     days = max(1, min(int(days), MAX_DAYS))
-    bare = _bare_symbol(symbol)
 
-    if days <= 90:
-        source = "eastmoney"
-        end = datetime.now().strftime("%Y%m%d")
-        lookback = int(days * 1.6) + 30
-        start = (datetime.now() - timedelta(days=lookback)).strftime("%Y%m%d")
-        df = ak.stock_zh_a_hist(
-            symbol=bare,
-            period="daily",
-            start_date=start,
-            end_date=end,
-            adjust="",
-        )
-    else:
-        source = "tencent"
-        df = ak.stock_zh_a_hist_tx(
-            symbol=_xq_symbol(symbol).lower(),
-            adjust="",
-        )
+    errors: list[str] = []
+    for source, fetcher in _KLINE_SOURCES:
+        last_err = None
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                df = fetcher(symbol, days)
+                if df is None or df.empty:
+                    last_err = "empty data"
+                    break
+                df = _normalize_kline(df, source)
+                tail = df.tail(days)
+                return {
+                    "ok": True,
+                    "symbol": symbol,
+                    "source": source,
+                    "days_requested": days,
+                    "count": len(tail),
+                    "data": _df_records(tail),
+                }
+            except Exception as e:
+                last_err = f"{type(e).__name__}: {e}"
+                log.warning("get_stock_price[%s] attempt %d/%d failed: %s", source, attempt, MAX_RETRIES, e)
+                if attempt < MAX_RETRIES:
+                    time.sleep(RETRY_DELAY * (RETRY_BACKOFF ** (attempt - 1)))
+        errors.append(f"{source}: {last_err}")
 
-    if df is None or df.empty:
-        return {"ok": False, "symbol": symbol, "error": "no data returned"}
-
-    tail = df.tail(days)
     return {
-        "ok": True,
+        "ok": False,
         "symbol": symbol,
-        "source": source,
-        "days_requested": days,
-        "count": len(tail),
-        "data": _df_records(tail),
+        "error": "all sources failed",
+        "details": errors,
     }
 
 
@@ -203,17 +259,36 @@ def get_stock_news(symbol: str, limit: int = 20) -> dict:
     return {"ok": True, "symbol": symbol, "count": len(df), "data": _df_records(df)}
 
 
+_NOTICE_CATEGORIES = {"全部", "财务报告", "融资公告", "风险提示", "资产重组", "信息变更", "重大事项", "持股变动"}
+
+
 @mcp.tool
 @ttl_cache(CACHE_TTL_NOTICE)
 @with_retry
 def get_stock_notice(symbol: str = "全部", date: str = "") -> dict:
-    """查询股票公告。symbol 可填具体代码（如 600519）或 "全部"；date 形如 YYYY-MM-DD，默认今天。"""
+    """查询股票公告（东方财富）。
+    symbol 可填具体代码（如 600519，将抓取当日全部公告后按代码过滤）或公告类别
+    （"全部" / "财务报告" / "融资公告" / "风险提示" / "资产重组" / "信息变更" / "重大事项" / "持股变动"）。
+    date 形如 YYYY-MM-DD，默认今天。
+    """
     if not date:
         date = datetime.now().strftime("%Y-%m-%d")
-    sym = symbol if symbol == "全部" else _bare_symbol(symbol)
-    df = ak.stock_notice_report(symbol=sym, date=date)
+
+    is_code = symbol not in _NOTICE_CATEGORIES
+    api_category = "全部" if is_code else symbol
+    df = ak.stock_notice_report(symbol=api_category, date=date)
+
     if df is None or df.empty:
         return {"ok": True, "symbol": symbol, "date": date, "count": 0, "data": []}
+
+    if is_code:
+        bare = _bare_symbol(symbol)
+        code_col = next((c for c in df.columns if "代码" in c), None)
+        if code_col is not None:
+            df = df[df[code_col].astype(str).str.endswith(bare)]
+        if df.empty:
+            return {"ok": True, "symbol": symbol, "date": date, "count": 0, "data": []}
+
     return {"ok": True, "symbol": symbol, "date": date, "count": len(df), "data": _df_records(df)}
 
 
@@ -296,17 +371,33 @@ def get_index_realtime(category: str = "上证系列指数") -> dict:
 @ttl_cache(CACHE_TTL_SECTOR)
 @with_retry
 def get_sector_ranking(category: str = "industry", limit: int = 30) -> dict:
-    """A 股板块涨跌排行。category: industry（行业板块）或 concept（概念板块）。"""
+    """A 股板块涨跌排行。category: industry（行业板块）或 concept（概念板块）。
+    数据源：东方财富，失败时回退新浪板块。
+    """
     cat = category.strip().lower()
-    if cat == "concept":
-        df = ak.stock_board_concept_name_em()
-    else:
-        cat = "industry"
-        df = ak.stock_board_industry_name_em()
+    source = "eastmoney"
+    df = None
+    try:
+        if cat == "concept":
+            df = ak.stock_board_concept_name_em()
+        else:
+            cat = "industry"
+            df = ak.stock_board_industry_name_em()
+    except Exception as e:
+        log.warning("sector ranking eastmoney failed, fallback to sina: %s", e)
+        df = None
+
+    if df is None or df.empty:
+        try:
+            df = ak.stock_sector_spot(indicator="新浪行业" if cat != "concept" else "概念")
+            source = "sina"
+        except Exception as e:
+            return {"ok": False, "error": f"all sector sources failed: {e}"}
+
     if df is None or df.empty:
         return {"ok": False, "error": "no sector data"}
     limit = max(1, min(int(limit), 100))
-    return {"ok": True, "category": cat, "count": min(len(df), limit), "data": _df_records(df.head(limit))}
+    return {"ok": True, "category": cat, "source": source, "count": min(len(df), limit), "data": _df_records(df.head(limit))}
 
 
 @mcp.tool
@@ -329,7 +420,10 @@ def get_lhb_detail(date: str = "") -> dict:
     if not date:
         date = datetime.now().strftime("%Y%m%d")
     date = date.replace("-", "")
-    df = ak.stock_lhb_detail_em(start_date=date, end_date=date)
+    try:
+        df = ak.stock_lhb_detail_em(start_date=date, end_date=date)
+    except (TypeError, KeyError, IndexError):
+        df = None
     if df is None or df.empty:
         return {"ok": True, "date": date, "count": 0, "data": []}
     return {"ok": True, "date": date, "count": len(df), "data": _df_records(df)}

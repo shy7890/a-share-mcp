@@ -265,31 +265,32 @@ _NOTICE_CATEGORIES = {"全部", "财务报告", "融资公告", "风险提示", 
 @mcp.tool
 @ttl_cache(CACHE_TTL_NOTICE)
 @with_retry
-def get_stock_notice(symbol: str = "全部", date: str = "") -> dict:
-    """查询股票公告（东方财富）。
-    symbol 可填具体代码（如 600519，将抓取当日全部公告后按代码过滤）或公告类别
-    （"全部" / "财务报告" / "融资公告" / "风险提示" / "资产重组" / "信息变更" / "重大事项" / "持股变动"）。
-    date 形如 YYYY-MM-DD，默认今天。
+def get_stock_notice(symbol: str = "全部", date: str = "", limit: int = 30) -> dict:
+    """查询股票公告。
+    - 传具体代码（如 600519）→ 走 CNINFO 单股披露，覆盖最近 90 天。
+    - 传公告类别（"全部"/"财务报告"/"融资公告"/"风险提示"/"资产重组"/"信息变更"/"重大事项"/"持股变动"）→ 走东方财富当日全市场公告，date 形如 YYYY-MM-DD，默认今天。
+      注意：当日全市场公告分页较多，请尽量带上具体类别而非"全部"。
     """
-    if not date:
-        date = datetime.now().strftime("%Y-%m-%d")
-
     is_code = symbol not in _NOTICE_CATEGORIES
-    api_category = "全部" if is_code else symbol
-    df = ak.stock_notice_report(symbol=api_category, date=date)
-
-    if df is None or df.empty:
-        return {"ok": True, "symbol": symbol, "date": date, "count": 0, "data": []}
+    limit = max(1, min(int(limit), 200))
 
     if is_code:
         bare = _bare_symbol(symbol)
-        code_col = next((c for c in df.columns if "代码" in c), None)
-        if code_col is not None:
-            df = df[df[code_col].astype(str).str.endswith(bare)]
-        if df.empty:
-            return {"ok": True, "symbol": symbol, "date": date, "count": 0, "data": []}
+        end = datetime.now().strftime("%Y%m%d")
+        start = (datetime.now() - timedelta(days=90)).strftime("%Y%m%d")
+        df = ak.stock_zh_a_disclosure_report_cninfo(symbol=bare, start_date=start, end_date=end)
+        if df is None or df.empty:
+            return {"ok": True, "symbol": symbol, "count": 0, "data": []}
+        df = df.head(limit)
+        return {"ok": True, "symbol": symbol, "source": "cninfo", "count": len(df), "data": _df_records(df)}
 
-    return {"ok": True, "symbol": symbol, "date": date, "count": len(df), "data": _df_records(df)}
+    if not date:
+        date = datetime.now().strftime("%Y-%m-%d")
+    df = ak.stock_notice_report(symbol=symbol, date=date)
+    if df is None or df.empty:
+        return {"ok": True, "symbol": symbol, "date": date, "count": 0, "data": []}
+    df = df.head(limit)
+    return {"ok": True, "symbol": symbol, "date": date, "source": "eastmoney", "count": len(df), "data": _df_records(df)}
 
 
 @mcp.tool
